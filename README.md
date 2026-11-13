@@ -1,7 +1,9 @@
-# claude-code-guardrails
+# claude-code-os
 
-The operating system I run around Claude Code: hooks, skills, rules and a memory layer that
-turn agent mistakes into checks the agent cannot skip.
+The operating system I run around Claude Code: memory, loop design, skills and hooks that let
+the agent carry work end to end on its own (a PR from review to a verified deploy, follow-ups
+on their due date, its own notes kept current) and turn each of its mistakes into a check it
+cannot skip.
 
 Every piece here exists because something went wrong once. The pattern is always the same:
 **a mistake becomes a written rule, and a written rule that gets broken again becomes a hook.**
