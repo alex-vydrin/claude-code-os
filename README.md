@@ -21,9 +21,6 @@ live in the system, not in my attention.
   context: the why, the edge cases, what I already tried. Longer, richer prompts are the
   cheapest quality gain I know of. The rules below are written for that style: the agent is
   told that restating is not approving, and that thinking out loud is not a sign-off.
-- **Talk in any language, persist in English.** I often dictate in Russian. Everything the
-  agent writes down (code, notes, memory, PRs) is English, and every chat reply is in the
-  language of my last message, for the whole session.
 - **The agent maintains its own memory.** It reads an Obsidian vault at session start and
   writes back to it without being asked whenever something changes that a future session
   will need. See [docs/memory-system.md](docs/memory-system.md).

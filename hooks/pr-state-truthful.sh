@@ -55,7 +55,7 @@ with_timeout() {
 
 # Forward-looking markers: the message is presenting work as still to be done.
 # English by default. Extend both lists for the language you talk to the agent in
-# (the author's own copy carries a Russian set) via PR_TRUTH_PENDING / PR_TRUTH_RESOLVED.
+# via PR_TRUTH_PENDING / PR_TRUTH_RESOLVED.
 PENDING=${PR_TRUTH_PENDING:-'ready to merge|ready for merge|waiting on you|waiting for you|left for you|left on you|needs your|pending your|your merge|still open|awaiting|to merge|remaining'}
 # ...unless the SAME line already states the true outcome.
 RESOLVED=${PR_TRUTH_RESOLVED:-'merged|closed|landed|shipped'}
