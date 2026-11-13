@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Run git-cleanup-merged in every repo under a root (default ~/Developer) that
+# has at least one linked worktree. Extra args are passed through (--apply,
+# --min-idle-hours N). One repo failing (no gh remote, fetch error) does not
+# stop the others.
+set -uo pipefail
+ROOT="$HOME/Developer"
+[ "${1:-}" = "--root" ] && { ROOT="$2"; shift 2; }
+for d in "$ROOT"/*/; do
+  d="${d%/}"
+  [ -d "$d/.git" ] || continue
+  n=$(git -C "$d" worktree list 2>/dev/null | wc -l | tr -d ' ')
+  [ "${n:-1}" -gt 1 ] || continue
+  "$HOME/.claude/bin/git-cleanup-merged" -C "$d" "$@" || echo "!! $(basename "$d"): exited $?"
+  echo
+done

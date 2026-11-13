@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: shellcheck
+        run: shellcheck -S warning hooks/*.sh bin/pr-pilot bin/git-cleanup-merged bin/git-cleanup-merged-all bin/prune-transcripts skills/*/*.sh install.sh tests/*.sh
+      - name: hook tests
+        run: bash tests/hooks.test.sh
+      - name: matcher tests
+        run: bash tests/babysit-pr-reminder.test.sh
+      - name: installer dry run
+        run: ./install.sh --dest "$RUNNER_TEMP/claude"
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

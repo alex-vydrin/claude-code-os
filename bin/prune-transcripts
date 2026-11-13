@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# prune-transcripts - delete local Claude session data older than N days.
+#
+# Covers what Claude Code's own cleanupPeriodDays leaves behind:
+#   projects   ~/.claude/projects/<proj>/<session>/   (subagents, workflows, tool-results)
+#   history    ~/.claude/file-history/<session>/      (snapshots of edited files)
+#   desktop    ~/Library/Application Support/Claude/local-agent-mode-sessions/**/local_<id>/
+#
+# A session directory is deleted as a whole, and only when no file inside it
+# (nor its sibling <session>.jsonl) was modified in the last N days.
+# memory/ directories are never touched. Never prints file contents.
+#
+# Usage: prune-transcripts [--days N] [--apply] [--list]
+#   default is a dry run; --apply deletes; --list prints each candidate path.
+set -euo pipefail
+
+DAYS=30
+APPLY=0
+LIST=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --days) DAYS="$2"; shift 2 ;;
+    --apply) APPLY=1; shift ;;
+    --list) LIST=1; shift ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+case "$DAYS" in ''|*[!0-9]*) echo "--days must be a positive integer" >&2; exit 2 ;; esac
+[ "$DAYS" -ge 7 ] || { echo "--days below 7 refused" >&2; exit 2; }
+
+CLAUDE="$HOME/.claude"
+DESKTOP="$HOME/Library/Application Support/Claude/local-agent-mode-sessions"
+LOG="$CLAUDE/logs/prune-transcripts.log"
+
+# Stale = no file inside modified within DAYS, and the sibling transcript (if any) is stale too.
+is_stale() {
+  local dir="$1" sibling="${2:-}"
+  [ -n "$(find "$dir" -type f -mtime "-$DAYS" -print -quit 2>/dev/null)" ] && return 1
+  if [ -n "$sibling" ] && [ -e "$sibling" ]; then
+    [ -n "$(find "$sibling" -mtime "-$DAYS" -print -quit)" ] && return 1
+  fi
+  return 0
+}
+
+total_dirs=0
+total_kb=0
+summary=""
+
+handle() {
+  local category="$1" dir="$2" kb
+  kb=$(du -sk "$dir" 2>/dev/null | cut -f1)
+  eval "n_$category=\$(( \${n_$category:-0} + 1 ))"
+  eval "kb_$category=\$(( \${kb_$category:-0} + kb ))"
+  total_dirs=$((total_dirs + 1))
+  total_kb=$((total_kb + kb))
+  [ "$LIST" -eq 1 ] && printf '  [%s] %s\n' "$category" "${dir/#$HOME/~}"
+  if [ "$APPLY" -eq 1 ]; then rm -rf -- "$dir"; fi
+}
+
+# projects: <proj>/<session-uuid>/ ; skip memory and anything not uuid-shaped
+uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+if [ -d "$CLAUDE/projects" ]; then
+  for proj in "$CLAUDE/projects"/*/; do
+    for dir in "$proj"*/; do
+      [ -d "$dir" ] || continue
+      name=$(basename "$dir")
+      [ "$name" = memory ] && continue
+      [[ "$name" =~ $uuid_re ]] || continue
+      is_stale "$dir" "${proj}${name}.jsonl" && handle projects "${dir%/}"
+    done
+  done
+fi
+
+# file-history: <session-uuid>/
+if [ -d "$CLAUDE/file-history" ]; then
+  for dir in "$CLAUDE/file-history"/*/; do
+    [ -d "$dir" ] || continue
+    [[ "$(basename "$dir")" =~ $uuid_re ]] || continue
+    is_stale "$dir" && handle history "${dir%/}"
+  done
+fi
+
+# Claude Desktop local agent sessions: any local_<id>/ directory
+if [ -d "$DESKTOP" ]; then
+  while IFS= read -r -d '' dir; do
+    is_stale "$dir" && handle desktop "$dir"
+  done < <(find "$DESKTOP" -type d -name 'local_*' -prune -print0)
+fi
+
+for c in projects history desktop; do
+  eval "n=\${n_$c:-0}; kb=\${kb_$c:-0}"
+  # shellcheck disable=SC2154  # n and kb are assigned by the eval above
+  summary+="$c=${n}dirs/$((kb / 1024))MB "
+done
+
+mode=$([ "$APPLY" -eq 1 ] && echo applied || echo dry-run)
+line="$(date '+%Y-%m-%dT%H:%M:%S') $mode days=$DAYS total=${total_dirs}dirs/$((total_kb / 1024))MB $summary"
+echo "$line"
+mkdir -p "$(dirname "$LOG")"
+echo "$line" >> "$LOG"

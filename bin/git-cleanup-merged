@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# Remove worktrees and delete local branches whose PR is MERGED on GitHub.
+#
+# Safety rules (a branch/worktree must clear ALL of them):
+#   - Its newest PR state is MERGED (CLOSED-unmerged and NO-PR are never touched).
+#   - Local branch head == the PR's merged headRefOid, OR the extra commits'
+#     content is already identical in the remote default branch (origin/HEAD).
+#   - Its worktree has no untracked files and no uncommitted tracked changes
+#     other than a lockfile (a lockfile-only change is removed with the worktree).
+#     Disposable untracked paths do not count: node_modules, .venv, *.orig.
+#   - Its worktree has been idle for --min-idle-hours (default 12).
+#   - Never the current branch, never develop/main/master/staging.
+#
+# Detached-HEAD worktrees (scratch checkouts with no branch) are removed too, when
+# their HEAD is contained in some remote branch, they are idle, and clean by the
+# same rules. Run across every repo by git-cleanup-merged-all.
+#
+# Usage: git-cleanup-merged [--apply] [-C <repo>]
+#        default is a DRY RUN.
+
+set -uo pipefail
+
+APPLY=0
+REPO="$PWD"
+MIN_IDLE_HOURS=12
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) APPLY=1; shift ;;
+    -C) [ $# -ge 2 ] || { echo "-C needs a value" >&2; exit 2; }; REPO="$2"; shift 2 ;;
+    --min-idle-hours) [ $# -ge 2 ] || { echo "--min-idle-hours needs a value" >&2; exit 2; }; MIN_IDLE_HOURS="$2"; shift 2 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+# A non-integer would make the idle comparison below silently false, i.e. treat
+# every worktree as idle. Refuse it instead.
+case "$MIN_IDLE_HOURS" in ''|*[!0-9]*) echo "--min-idle-hours must be a whole number of hours" >&2; exit 2 ;; esac
+
+# Hours since a worktree last saw git activity (its index file mtime).
+# Cheap, but only a proxy: an agent editing files without running git leaves the
+# index untouched, so the dirty/untracked checks below are what protect its work.
+wt_idle_hours() {
+  local gd idx
+  gd=$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null) || { echo 99999; return; }
+  idx="$gd/index"
+  [ -f "$idx" ] || { echo 99999; return; }
+  python3 - "$idx" <<'PYEOF'
+import os,sys,time
+try: print(int((time.time()-os.path.getmtime(sys.argv[1]))//3600))
+except Exception: print(99999)
+PYEOF
+}
+
+# Lines of `git status --porcelain` that block removing a worktree. Untracked
+# node_modules / .venv / *.orig and tracked lockfile changes are disposable.
+blockers() {
+  git -C "$1" --no-optional-locks status --porcelain 2>/dev/null | while IFS= read -r l; do
+    [ -z "$l" ] && continue
+    p="${l:3}"
+    case "$l" in
+      '?? '*) printf '%s\n' "$p" | grep -qE '(^|/)(node_modules|\.venv)/?$|\.orig$' && continue ;;
+      *)      printf '%s\n' "$p" | grep -qE '(^|/)(bun\.lock|package-lock\.json|yarn\.lock)$' && continue ;;
+    esac
+    printf '%s\n' "$l"
+  done
+}
+
+cd "$REPO" || exit 1
+git rev-parse --git-dir >/dev/null 2>&1 || { echo "not a git repo: $REPO" >&2; exit 1; }
+
+PROTECTED="develop main master staging"
+CURRENT=$(git branch --show-current)
+
+echo "== git-cleanup-merged @ $(date '+%Y-%m-%d %H:%M:%S %Z') =="
+echo "repo:    $(pwd)"
+echo "mode:    $([ $APPLY -eq 1 ] && echo APPLY || echo 'DRY RUN (use --apply to execute)')"
+echo "idle:    skip worktrees touched within ${MIN_IDLE_HOURS}h"
+echo "current: $CURRENT"
+echo
+
+# This repo often has several agent sessions running git concurrently, so a
+# fetch can lose a race for FETCH_HEAD.lock. Retry before giving up. A failed
+# fetch is safe (gh is the authoritative merge signal, and a stale origin/develop
+# only makes the "already in develop" check MORE conservative) but degrades.
+fetch_err=""
+for attempt in 1 2 3; do
+  fetch_err=$(git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=120 fetch --prune origin 2>&1) && { fetch_err=""; break; }
+  [ "$attempt" -lt 3 ] && sleep $((attempt * 5))
+done
+[ -n "$fetch_err" ] && echo "WARN: fetch failed after 3 attempts, using cached refs: $(echo "$fetch_err" | head -2 | tr '\n' ' ')"
+
+# The default branch differs per repo (develop / main / master).
+BASE=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)
+if [ -z "$BASE" ]; then
+  for c in develop main master; do
+    git rev-parse -q --verify "origin/$c" >/dev/null && { BASE="origin/$c"; break; }
+  done
+fi
+[ -n "$BASE" ] || { echo "ERROR: cannot determine the remote default branch. Aborting without changes." >&2; exit 1; }
+echo "base:    $BASE"
+
+# ---------- fetch ALL PRs in one shot ----------
+# (plus one fallback call per branch outside the last 1000 PRs, see below)
+# One bulk query instead of ~2 gh calls per branch: on a repo with dozens of
+# local branches that is the difference between ~15 minutes and a few seconds.
+PRMAP=$(mktemp)
+trap 'rm -f "$PRMAP" "${WTMAP:-}"' EXIT
+if ! gh pr list --state all --limit 1000 \
+      --json number,state,headRefName,headRefOid 2>/dev/null \
+    | python3 -c '
+import json,sys
+prs = json.load(sys.stdin)
+best = {}
+for p in prs:
+    b = p["headRefName"]
+    cur = best.get(b)
+    # A branch can carry several PRs. A MERGED one always wins (its content
+    # landed); otherwise the highest-numbered (newest) PR describes the branch.
+    key = (1 if p["state"] == "MERGED" else 0, p["number"])
+    if cur is None or key > cur[0]:
+        best[b] = (key, p)
+for b,(k,p) in best.items():
+    print("\t".join([b, p["state"], str(p["number"]), p["headRefOid"]]))
+' > "$PRMAP"; then
+  echo "ERROR: could not list PRs from GitHub (gh auth?). Aborting without changes." >&2
+  exit 1
+fi
+[ -s "$PRMAP" ] || { echo "ERROR: PR list came back empty. Aborting without changes." >&2; exit 1; }
+echo "PRs indexed: $(wc -l < "$PRMAP" | tr -d ' ')"
+echo
+
+# ---------- classify every local branch ----------
+DEL_BRANCH=()
+SKIP=()
+while read -r b; do
+  [ -z "$b" ] && continue
+  case " $PROTECTED " in *" $b "*) continue ;; esac
+
+  row=$(awk -F'\t' -v b="$b" '$1==b{print; exit}' "$PRMAP")
+  if [ -z "$row" ]; then
+    # Not in the recent-PR window (the bulk list is capped). Ask about this one
+    # branch directly, so a branch whose PR merged long ago is still reaped
+    # instead of silently sticking around forever.
+    row=$(gh pr list --head "$b" --state all --limit 10 \
+            --json number,state,headRefName,headRefOid 2>/dev/null \
+          | python3 -c '
+import json,sys
+prs=json.load(sys.stdin)
+if prs:
+    p=max(prs,key=lambda p:(1 if p["state"]=="MERGED" else 0,p["number"]))
+    print("\t".join([p["headRefName"],p["state"],str(p["number"]),p["headRefOid"]]))
+')
+  fi
+  if [ -z "$row" ]; then
+    SKIP+=("$b|NO-PR|no pull request found"); continue
+  fi
+  state=$(printf '%s' "$row" | cut -f2)
+  num=$(printf '%s' "$row" | cut -f3)
+  oid=$(printf '%s' "$row" | cut -f4)
+
+  if [ "$state" != "MERGED" ]; then
+    SKIP+=("$b|#$num $state|not merged"); continue
+  fi
+
+  loc=$(git rev-parse "$b")
+  if [ "$loc" != "$oid" ]; then
+    # Commits past the merged head are safe only if every file they touch is
+    # byte-identical in $BASE (i.e. it landed via a follow-up PR).
+    if ! git cat-file -e "${oid}^{commit}" 2>/dev/null; then
+      SKIP+=("$b|#$num MERGED|merged head ${oid:0:9} not available locally"); continue
+    fi
+    extra_ok=1
+    while read -r f; do
+      [ -z "$f" ] && continue
+      git diff --quiet "$BASE" "$b" -- "$f" 2>/dev/null || { extra_ok=0; break; }
+    done < <(git diff --name-only "$oid" "$b" 2>/dev/null)
+    if [ "$extra_ok" -ne 1 ]; then
+      SKIP+=("$b|#$num MERGED|has commits past the merged head not in $BASE"); continue
+    fi
+  fi
+
+  if [ "$b" = "$CURRENT" ]; then
+    SKIP+=("$b|#$num MERGED|is the current branch of the main checkout"); continue
+  fi
+  DEL_BRANCH+=("$b|$num")
+done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
+# ---------- map branch -> worktree, check dirtiness ----------
+# bash 3.2 on macOS has no associative arrays: use a plain lookup table file.
+WTMAP=$(mktemp)
+git worktree list --porcelain \
+  | awk '/^worktree /{sub(/^worktree /,""); wt=$0} /^branch /{sub(/^branch refs\/heads\//,""); print $0"\t"wt}' > "$WTMAP"
+
+MAIN_WT=$(git worktree list --porcelain | head -1 | sed 's/^worktree //')
+
+# Prints BLOCK:<reason>, or the removal note ("clean" / "disposable only: ...").
+wt_verdict() {
+  local wt="$1" idle bl all
+  idle=$(wt_idle_hours "$wt")
+  if [ "$idle" -lt "$MIN_IDLE_HOURS" ] 2>/dev/null; then
+    echo "BLOCK:worktree active ${idle}h ago (< ${MIN_IDLE_HOURS}h idle guard)"; return
+  fi
+  # Untracked files block (other than disposable ones): removing the worktree
+  # would delete them, and nothing about a merged PR says they were throwaway.
+  bl=$(blockers "$wt")
+  if [ -n "$bl" ]; then
+    echo "BLOCK:worktree has uncommitted work: $(printf '%s\n' "$bl" | cut -c4- | tr '\n' ' ')"; return
+  fi
+  all=$(git -C "$wt" --no-optional-locks status --porcelain 2>/dev/null)
+  if [ -z "$all" ]; then echo "clean"; else echo "disposable only: $(printf '%s\n' "$all" | cut -c4- | tr '\n' ' ')"; fi
+}
+
+DEL_WT=()
+DEL_BRANCH_FINAL=()
+for entry in ${DEL_BRANCH[@]+"${DEL_BRANCH[@]}"}; do
+  b="${entry%%|*}"; num="${entry##*|}"
+  wt=$(awk -F'\t' -v b="$b" '$1==b{print $2; exit}' "$WTMAP")
+  if [ -n "$wt" ] && [ "$wt" != "$MAIN_WT" ] && [ -d "$wt" ]; then
+    v=$(wt_verdict "$wt")
+    case "$v" in
+      BLOCK:*) SKIP+=("$b|#$num MERGED|${v#BLOCK:}"); continue ;;
+      *)       DEL_WT+=("$wt|$b|$v") ;;
+    esac
+  fi
+  DEL_BRANCH_FINAL+=("$entry")
+done
+
+# ---------- detached-HEAD worktrees ----------
+# Scratch checkouts with no branch. Safe once HEAD is on some remote branch,
+# so removing the worktree loses no commit.
+while IFS= read -r wt; do
+  [ -z "$wt" ] || [ "$wt" = "$MAIN_WT" ] || [ ! -d "$wt" ] && continue
+  head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || continue
+  if [ -z "$(git for-each-ref --count=1 --contains "$head" --format='x' refs/remotes)" ]; then
+    SKIP+=("$wt|DETACHED|HEAD ${head:0:9} is on no remote branch"); continue
+  fi
+  v=$(wt_verdict "$wt")
+  case "$v" in
+    BLOCK:*) SKIP+=("$wt|DETACHED|${v#BLOCK:}") ;;
+    *)       DEL_WT+=("$wt|(detached)|$v") ;;
+  esac
+done < <(git worktree list --porcelain | awk '/^worktree /{sub(/^worktree /,""); wt=$0} /^detached/{print wt}')
+
+# ---------- report ----------
+echo "--- WORKTREES to remove (${#DEL_WT[@]}) ---"
+for e in ${DEL_WT[@]+"${DEL_WT[@]}"}; do [ -n "$e" ] && printf '  %s\n     branch=%s  [%s]\n' "${e%%|*}" "$(echo "$e"|cut -d'|' -f2)" "$(echo "$e"|cut -d'|' -f3)"; done
+echo
+echo "--- BRANCHES to delete (${#DEL_BRANCH_FINAL[@]}) ---"
+for e in ${DEL_BRANCH_FINAL[@]+"${DEL_BRANCH_FINAL[@]}"}; do [ -n "$e" ] && printf '  %-60s (PR #%s)\n' "${e%%|*}" "${e##*|}"; done
+echo
+echo "--- KEPT (${#SKIP[@]}) ---"
+for e in ${SKIP[@]+"${SKIP[@]}"}; do [ -n "$e" ] && printf '  %-58s %-16s %s\n' "$(echo "$e"|cut -d'|' -f1)" "$(echo "$e"|cut -d'|' -f2)" "$(echo "$e"|cut -d'|' -f3)"; done
+echo
+
+if [ $APPLY -eq 0 ]; then
+  echo "DRY RUN: nothing changed. Re-run with --apply to execute."
+  exit 0
+fi
+
+echo "--- applying ---"
+for e in ${DEL_WT[@]+"${DEL_WT[@]}"}; do
+  [ -z "$e" ] && continue
+  wt="${e%%|*}"; note="$(echo "$e"|cut -d'|' -f3)"
+  if [ "$note" = "clean" ]; then
+    git worktree remove "$wt" && echo "  removed worktree $wt"
+  elif [ -n "$(blockers "$wt")" ]; then
+    # --force deletes whatever is there NOW, so re-check it is still disposable.
+    echo "  KEPT worktree $wt: changed since it was classified"
+  else
+    git worktree remove --force "$wt" && echo "  removed worktree $wt ($note)"
+  fi
+done
+git worktree prune
+
+for e in ${DEL_BRANCH_FINAL[@]+"${DEL_BRANCH_FINAL[@]}"}; do
+  [ -z "$e" ] && continue
+  b="${e%%|*}"
+  git branch -D "$b" >/dev/null && echo "  deleted branch $b"
+done
+
+echo
+echo "done. worktrees=$(git worktree list | wc -l | tr -d ' ')  branches=$(git branch | wc -l | tr -d ' ')"

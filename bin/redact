@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Mask credentials in anything on its way to a chat window.
+
+Born from a real leak on 2026-08-26: a CDN provider's API response was printed
+with `ApiKey` hidden by hand and the field `ApiAccessKey`, holding the same
+value, left in the clear. Hand-picking what to hide is a denylist, and a
+denylist is always one field short.
+
+So this works the other way round. Any JSON key whose NAME looks like a
+credential has its value replaced, however deep it sits and whatever shape the
+value has - no prefix to recognise, no length to guess. Plain text falls back to
+masking the token shapes we know.
+
+    curl -s ... | ~/.claude/bin/redact
+    curl -s ... | ~/.claude/bin/redact Id Name PullZoneId   # only these survive
+
+With field names as arguments it flips to an allowlist and prints just those,
+which is the safer habit for exploring an unfamiliar API: you cannot leak a
+field you never asked for.
+"""
+import json
+import re
+import sys
+
+SENSITIVE = re.compile(
+    r'(key|secret|token|password|passwd|credential|signature|cookie|authorization|auth|apikey|access)',
+    re.I,
+)
+# Prefixed tokens, for output that is not JSON at all.
+SHAPES = re.compile(
+    r'\b(sb_pat_|nfp_|figd_|ghp_|gho_|ghs_|github_pat_|xox[baprs]-|glpat-|AKIA|ASIA|sk-|pat-)'
+    r'[A-Za-z0-9_\-]{8,}',
+)
+MASK = '<redacted>'
+
+
+def clean(node):
+    if isinstance(node, dict):
+        return {k: (MASK if SENSITIVE.search(k) and node[k] not in (None, '', 0, False)
+                    else clean(v)) for k, v in node.items()}
+    if isinstance(node, list):
+        return [clean(v) for v in node]
+    if isinstance(node, str):
+        return SHAPES.sub(MASK, node)
+    return node
+
+
+def pick(node, fields):
+    """Keep only the named fields, at any depth. Everything else is dropped."""
+    if isinstance(node, dict):
+        return {k: clean(v) for k, v in node.items() if k in fields}
+    if isinstance(node, list):
+        return [pick(v, fields) for v in node]
+    return node
+
+
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    # Not JSON. Mask what can be recognised and say so, because a bare
+    # credential in a non-JSON body is exactly what this cannot promise to catch.
+    sys.stdout.write(SHAPES.sub(MASK, raw))
+    sys.exit(0)
+
+fields = set(sys.argv[1:])
+out = pick(data, fields) if fields else clean(data)
+json.dump(out, sys.stdout, ensure_ascii=False, indent=1)
+sys.stdout.write('\n')

@@ -1,0 +1,33 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Write|Edit|MultiEdit|NotebookEdit|NotebookRead|Glob|Grep",
+        "hooks": [{ "type": "command", "command": "$HOME/.claude/hooks/block-secrets-file-tools.sh" }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "$HOME/.claude/hooks/babysit-pr-reminder.sh" },
+          { "type": "command", "command": "$HOME/.claude/hooks/pr-pilot-register.sh" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$HOME/.claude/hooks/require-pr-links.sh" },
+          { "type": "command", "command": "$HOME/.claude/hooks/pr-state-truthful.sh" },
+          { "type": "command", "command": "$HOME/.claude/hooks/pr-pilot-guard.sh" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [{ "type": "command", "command": "$HOME/.claude/hooks/pending-checks.sh" }]
+      }
+    ]
+  }
+}

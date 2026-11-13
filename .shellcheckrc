@@ -1,0 +1,2 @@
+# "done" is a pr-pilot phase name passed as an argument, not the loop keyword.
+disable=SC1010

@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# pr-pilot: durable state + one deterministic wait for the PR lifecycle
+# (babysit rounds -> merge -> deploy -> verify), so the chain no longer lives
+# only in the agent's head.
+#
+# Why (2026-10-27): every wait in babysit-pr / watch-pr-merge-verify was already
+# a background shell (no token cost). What failed was the hand-off AFTER a wait:
+# the job exited, the agent woke up and dropped the next step - a skipped last
+# round, a merge nobody acted on, a deploy nobody waited for. Here the state is
+# a file, the next wait is chosen by the script from that file plus GitHub, and
+# the Stop hook ~/.claude/hooks/pr-pilot-guard.sh refuses to end a turn while a
+# tracked PR is unfinished and nothing is watching it.
+#
+# State: ~/.claude/pr-pilot/state/<owner>__<repo>__<pr>.json
+# Phases:
+#   babysit  review rounds (wait = wait-for-review.sh)
+#   merge    marker posted, waiting for the merge
+#   deploy   merged, waiting for the merge commit's push runs, statuses and check-runs
+#   verify   deployed; agent runs the post-deploy verification
+#   human    held for a human; `wait` still watches for the merge (2026-10-29)
+#   done     finished (guard exempt)
+#
+# Commands:
+#   track  <owner/repo> <pr> [--verify "<plan>"] [--next "<actions>"]
+#   set    <owner/repo> <pr> key=value ...   (phase round verify next note)
+#   wait   <owner/repo> <pr>                 run with run_in_background: true
+#   done   <owner/repo> <pr> "<reason>"
+#   status [all]
+#   prune  [--check-open]                    delete finished state (see below)
+#
+# Retention (2026-11-02, 107 finished files had piled up): a `done` file is
+# kept DONE_KEEP_DAYS (default 3) for `status all`, then deleted. `track` runs
+# that cheap prune on every call, so the directory stays bounded with no cron.
+# `prune --check-open` also asks GitHub about unfinished files idle for
+# STALE_DAYS (default 7) and deletes the ones whose PR is merged or closed;
+# idle files for still-open PRs are kept and listed. The Stop guard already
+# ignores files idle >24 h, so a stale file only costs disk, never a block.
+#
+# `wait` prints exactly one line starting with ACTION / TIMEOUT / ERROR at the
+# end; that line names the next step. Exit: 0 an event needs the agent,
+# 1 timeout, 2 usage/error, 3 nothing to wait for in this phase.
+# Test overrides: PR_PILOT_POLL, PR_PILOT_MERGE_POLL, PR_PILOT_MERGE_CAP, PR_PILOT_DEPLOY_CAP (seconds).
+
+set -uo pipefail
+
+DIR="${PR_PILOT_DIR:-$HOME/.claude/pr-pilot/state}"
+SKILLS="$HOME/.claude/skills/babysit-pr"
+POLL=${PR_PILOT_POLL:-60}
+# Merge phase: PR state every MERGE_POLL s (2026-10-29: a human merged a PR and the
+# 60 s poll took ~40 s to notice; a merge must be seen within seconds). The
+# automerge-blocked comment scan stays on POLL: it is the costlier call.
+MERGE_POLL=${PR_PILOT_MERGE_POLL:-5}
+MERGE_CAP=${PR_PILOT_MERGE_CAP:-6900}     # 1 h 55 min: under the 2 h background-task kill, so TIMEOUT is printed, not lost
+DEPLOY_CAP=${PR_PILOT_DEPLOY_CAP:-2700}   # 45 min
+DONE_KEEP_DAYS=${PR_PILOT_DONE_KEEP_DAYS:-3}
+STALE_DAYS=${PR_PILOT_STALE_DAYS:-7}
+mkdir -p "$DIR"
+
+die() { echo "ERROR $*"; exit 2; }
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+file_for() { echo "$DIR/${1%%/*}__${1##*/}__$2.json"; }
+PROFILES="${PR_PILOT_PROFILES:-$HOME/.claude/deploy-profiles}"
+
+# Where this repo's deploy profile is: what a merge deploys, the "is it live" check,
+# smoke and logs. Read by watch-pr-merge-verify; built per $PROFILES/README.md when missing.
+profile_for() {
+  local f="$PROFILES/${REPO%%/*}__${REPO##*/}.md"
+  if [ -f "$f" ]; then echo "$f"
+  elif grep -qF "| $REPO |" "$PROFILES/ci-only.md" 2>/dev/null; then echo "ci-only (nothing deploys on merge, $PROFILES/ci-only.md)"
+  else echo "MISSING - build it per $PROFILES/README.md"; fi
+}
+
+need_args() {
+  [ -n "${REPO:-}" ] && [ -n "${PR:-}" ] || die "usage: pr-pilot $CMD <owner/repo> <pr>"
+  [[ "$REPO" == */* ]] || die "repo must be owner/repo, got '$REPO'"
+  [[ "$PR" =~ ^[0-9]+$ ]] || die "pr must be a number, got '$PR'"
+  F=$(file_for "$REPO" "$PR")
+}
+
+get() { jq -r --arg k "$1" '.[$k] // empty' "$F" 2>/dev/null; }
+
+put() {  # put key value [key value ...]; string values
+  local tmp args=()
+  while [ $# -ge 2 ]; do args+=(--arg "$1" "$2"); shift 2; done
+  tmp=$(mktemp "$DIR/.tmp.XXXXXX")
+  jq "${args[@]}" --arg updated "$(now)" '
+    . as $o | $ARGS.named | to_entries
+    | reduce .[] as $e ($o; .[$e.key] = (if $e.key == "round" then ($e.value|tonumber) else $e.value end))
+  ' "$F" > "$tmp" && mv "$tmp" "$F"
+}
+
+# Age in whole days of an ISO-8601 UTC stamp (BSD date first, GNU fallback).
+age_days() {
+  local t
+  t=$(date -j -u -f %Y-%m-%dT%H:%M:%SZ "$1" +%s 2>/dev/null || date -u -d "$1" +%s 2>/dev/null) || { echo 0; return; }
+  echo $(( ( $(date -u +%s) - t ) / 86400 ))
+}
+
+cmd_prune() {
+  local check_open="" f phase upd repo pr st n=0
+  [ "${1:-}" = "--check-open" ] && check_open=1
+  for f in "$DIR"/*.json; do
+    [ -e "$f" ] || break
+    phase=$(jq -r '.phase // ""' "$f" 2>/dev/null)
+    upd=$(jq -r '.updated // .created // ""' "$f" 2>/dev/null)
+    if [ -z "$phase" ]; then rm -f "$f"; n=$((n+1)); continue; fi   # unreadable state
+    if [ "$phase" = done ]; then
+      [ "$(age_days "$upd")" -ge "$DONE_KEEP_DAYS" ] && { rm -f "$f"; n=$((n+1)); }
+      continue
+    fi
+    [ -n "$check_open" ] || continue
+    [ "$(age_days "$upd")" -ge "$STALE_DAYS" ] || continue
+    repo=$(jq -r .repo "$f"); pr=$(jq -r .pr "$f")
+    st=$(gh pr view "$pr" --repo "$repo" --json state -q .state 2>/dev/null) || continue
+    case "$st" in
+      MERGED|CLOSED) rm -f "$f"; n=$((n+1)) ;;
+      *) echo "PR-PILOT kept $repo#$pr phase=$phase (open, idle $(age_days "$upd")d)" ;;
+    esac
+  done
+  [ -n "$check_open" ] && echo "PR-PILOT pruned $n file(s)"
+  return 0
+}
+
+cmd_track() {
+  need_args
+  cmd_prune
+  local verify="" next=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --verify) verify=${2:-}; shift 2 ;;
+      --next)   next=${2:-};   shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  local st
+  st=$(gh pr view "$PR" --repo "$REPO" --json state -q .state 2>/dev/null) || die "cannot read $REPO#$PR"
+  if [ ! -f "$F" ]; then
+    jq -n --arg repo "$REPO" --arg pr "$PR" --arg created "$(now)" \
+      '{repo:$repo, pr:($pr|tonumber), phase:"babysit", round:0, session:"", verify:"", next:"",
+        heads:[], watcher_pid:"", note:"", created:$created, updated:$created}' > "$F"
+  fi
+  [ -n "$verify" ] && put verify "$verify"
+  [ -n "$next" ] && put next "$next"
+  case "$st" in
+    MERGED) [ "$(get phase)" = babysit ] && put phase deploy ;;
+    CLOSED) put phase done note "closed when tracked" ;;
+  esac
+  # The PostToolUse hook pr-pilot-register.sh reads this line and stamps the session id.
+  echo "PR-PILOT-TRACKED $REPO#$PR phase=$(get phase)"
+}
+
+cmd_set() {
+  need_args
+  [ -f "$F" ] || die "$REPO#$PR is not tracked (run track first)"
+  local kv
+  for kv in "$@"; do
+    case "${kv%%=*}" in
+      phase)
+        case "${kv#*=}" in babysit|merge|deploy|verify|human|done) ;; *) die "bad phase '${kv#*=}'" ;; esac ;;
+      round|verify|next|note) ;;
+      *) die "unknown key '${kv%%=*}'" ;;
+    esac
+    put "${kv%%=*}" "${kv#*=}"
+  done
+  echo "PR-PILOT $REPO#$PR phase=$(get phase) round=$(get round)"
+}
+
+cmd_done() {
+  need_args
+  [ -f "$F" ] || die "$REPO#$PR is not tracked"
+  put phase done note "${1:-no reason given}"
+  echo "PR-PILOT $REPO#$PR done: $(get note)"
+}
+
+cmd_status() {
+  local f
+  for f in "$DIR"/*.json; do
+    [ -e "$f" ] || { echo "no tracked PRs"; return 0; }
+    jq -r --arg all "${1:-}" '
+      select($all == "all" or .phase != "done")
+      | "\(.repo)#\(.pr)  phase=\(.phase) round=\(.round) watcher=\(.watcher_pid // "")  verify=\(if .verify == "" then "-" else "yes" end) next=\(if .next == "" then "-" else "yes" end)  \(.note)"
+    ' "$f"
+  done
+}
+
+pr_state() { gh pr view "$PR" --repo "$REPO" --json state,mergeCommit,headRefOid \
+  -q '"\(.state) \(.mergeCommit.oid // "-") \(.headRefOid)"' 2>/dev/null; }
+
+on_merged() {  # $1 = merge sha
+  put merge_sha "$1" phase deploy
+  echo "ACTION merged $REPO#$PR at ${1:0:7}. Do the queued next actions now: [$(get next)]." \
+       "Deploy profile: $(profile_for)." \
+       "Then run '~/.claude/bin/pr-pilot wait $REPO $PR' in the background for the deploy," \
+       "or '~/.claude/bin/pr-pilot done $REPO $PR \"<reason>\"' when nothing waits on the deploy."
+  exit 0
+}
+
+wait_babysit() {
+  local round head out rc
+  round=$(( $(get round) + 1 ))
+  head=$(gh pr view "$PR" --repo "$REPO" --json headRefOid -q .headRefOid 2>/dev/null)
+  [ ${#head} -eq 40 ] || die "cannot resolve head of $REPO#$PR"
+  put round "$round"
+  jq --arg h "$head" 'if (.heads[-1] // "") == $h then . else .heads += [$h] end' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+  # The review wait runs in the background while the PR state is polled, so a
+  # merge in the middle of a round (the owner can force-merge at any time) is seen
+  # within MERGE_POLL seconds, not at the review wait's 20-minute cap (2026-10-29).
+  local tmp bg s
+  tmp=$(mktemp "$DIR/.review.XXXXXX")
+  "$SKILLS/wait-for-review.sh" "$PR" "$REPO" >"$tmp" 2>&1 &
+  bg=$!
+  while kill -0 "$bg" 2>/dev/null; do
+    s=$(pr_state)
+    case "$s" in
+      MERGED*) kill "$bg" 2>/dev/null; wait "$bg" 2>/dev/null; rm -f "$tmp"
+               put round "$(( round - 1 ))"   # no review round happened
+               set -- $s; on_merged "$2" ;;
+    esac
+    sleep "$MERGE_POLL"
+  done
+  wait "$bg"; rc=$?
+  out=$(cat "$tmp"); rm -f "$tmp"
+  echo "$out" | tail -3
+  case $rc in
+    0) # Re-read the head: one read right after a push can still return the old
+       # one, and a stale `heads` makes the merge phase report a false
+       # "new-head" for the commit this review just covered (2026-10-29).
+       local h2; h2=$(gh pr view "$PR" --repo "$REPO" --json headRefOid -q .headRefOid 2>/dev/null)
+       if [ ${#h2} -eq 40 ] && [ "$h2" != "$head" ]; then
+         head=$h2
+         jq --arg h "$head" 'if (.heads[-1] // "") == $h then . else .heads += [$h] end' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+       fi
+       echo "ACTION review-arrived $REPO#$PR round=$round head=${head:0:7}." \
+            "Run review-verdict.sh, fetch all three comment surfaces, triage, fix, push once" \
+            "(Codex: post '@codex review' after the push)." \
+            "Not done yet -> '~/.claude/bin/pr-pilot wait $REPO $PR' again (next round)." \
+            "Stop condition met -> marker only where an automerge workflow reads it, run the mergeable check, then" \
+            "'~/.claude/bin/pr-pilot set $REPO $PR phase=merge' and '~/.claude/bin/pr-pilot wait $REPO $PR'."
+       exit 0 ;;
+    1) put round "$(( round - 1 ))"   # a timed-out wait is not a triaged round
+       echo "ACTION review-timeout $REPO#$PR head=${head:0:7}." \
+            "If this head was not re-triggered yet: check the PR is open, re-trigger it the reviewer's way" \
+            "(babysit-pr reviewer table: '@codex review', 'gh workflow run' for a workflow reviewer, '@<bot> review')," \
+            "then '~/.claude/bin/pr-pilot wait $REPO $PR'. If it already was: stop condition 5 (review never came)," \
+            "then '~/.claude/bin/pr-pilot set $REPO $PR phase=merge' and wait."
+       exit 0 ;;
+    4) put round "$(( round - 1 ))"   # no review round happened
+       local s; s=$(pr_state)
+       case "$s" in MERGED*) set -- $s; on_merged "$2" ;; esac
+       put phase done note "closed during babysit"
+       echo "ACTION closed $REPO#$PR was closed without merging during babysit. Report it; nothing more to do."
+       exit 0 ;;
+    *) put round "$(( round - 1 ))"; die "wait-for-review.sh exit $rc" ;;
+  esac
+}
+
+wait_merge() {
+  local start s blocked head last_scan=0
+  start=$(date +%s)
+  while [ $(( $(date +%s) - start )) -lt "$MERGE_CAP" ]; do
+    s=$(pr_state)
+    case "$s" in
+      MERGED*) set -- $s; on_merged "$2" ;;
+      CLOSED*) put phase done note "closed without merging"
+               echo "ACTION closed $REPO#$PR closed without merging. Report it; nothing to verify."; exit 0 ;;
+      OPEN*)   set -- $s; head=$3
+               blocked=0
+               if [ $(( $(date +%s) - last_scan )) -ge "$POLL" ]; then
+               last_scan=$(date +%s)
+               blocked=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+                 --jq "[.[] | select(.body | contains(\"<!-- automerge-blocked: $head -->\"))] | length" 2>/dev/null \
+                 | awk '{s+=$1} END {print s+0}')
+               fi
+               if [ "${blocked:-0}" -gt 0 ]; then
+                 put phase human note "automerge-blocked on ${head:0:7}"
+                 echo "ACTION held $REPO#$PR carries automerge-blocked for head ${head:0:7}." \
+                      "Surface that decision to the human (phase set to human). Waiting further changes nothing."
+                 exit 0
+               fi
+               if [ "$(jq -r '.heads[-1] // ""' "$F")" != "$head" ] && [ "$(jq -r '.heads | length' "$F")" -gt 0 ]; then
+                 put phase babysit
+                 echo "ACTION new-head $REPO#$PR head moved to ${head:0:7} after the marker." \
+                      "That head is unreviewed and unmarked: back to babysit, '~/.claude/bin/pr-pilot wait $REPO $PR'."
+                 exit 0
+               fi ;;
+      *) echo "poll: could not read PR state (API?)" >&2 ;;
+    esac
+    sleep "$MERGE_POLL"
+  done
+  echo "TIMEOUT $REPO#$PR still unmerged after $(( MERGE_CAP / 60 )) min." \
+       "Tell the human, then '~/.claude/bin/pr-pilot set $REPO $PR phase=human' (or wait again if they ask)."
+  exit 1
+}
+
+wait_human() {
+  # Held for a human (a decision, or a merge they do themselves). Nothing to do until
+  # they act, but their merge must still be seen: an unwatched human phase is how a
+  # merge went unnoticed on 2026-10-29.
+  local start s
+  start=$(date +%s)
+  while [ $(( $(date +%s) - start )) -lt "$MERGE_CAP" ]; do
+    s=$(pr_state)
+    case "$s" in
+      MERGED*) set -- $s; on_merged "$2" ;;
+      CLOSED*) put phase done note "closed without merging while held"
+               echo "ACTION closed $REPO#$PR was closed without merging while held for a human. Report it."; exit 0 ;;
+    esac
+    sleep "$MERGE_POLL"
+  done
+  echo "TIMEOUT $REPO#$PR still held and unmerged after $(( MERGE_CAP / 60 )) min." \
+       "Nothing to do: run '~/.claude/bin/pr-pilot wait $REPO $PR' again in the background."
+  exit 1
+}
+
+wait_deploy() {
+  local sha start runs pending failed statuses checks settled=0
+  sha=$(get merge_sha)
+  [ -n "$sha" ] && [ "$sha" != "-" ] || sha=$(gh pr view "$PR" --repo "$REPO" --json mergeCommit -q .mergeCommit.oid 2>/dev/null)
+  [ ${#sha} -eq 40 ] || die "no merge commit for $REPO#$PR"
+  start=$(date +%s)
+  sleep 20   # push runs register a few seconds after the merge
+  while [ $(( $(date +%s) - start )) -lt "$DEPLOY_CAP" ]; do
+    runs=$(gh run list --repo "$REPO" --commit "$sha" --event push --limit 100 \
+           --json name,status,conclusion 2>/dev/null) || { sleep "$POLL"; continue; }
+    statuses=$(gh api "repos/$REPO/commits/$sha/status" --jq '.statuses' 2>/dev/null || echo '[]')
+    # Check-runs of other apps are where deploys outside Actions report: Cloud Build
+    # (google-cloud-build), Cloudflare Workers Builds, Vercel. Actions' own check-runs
+    # duplicate $runs, so they are left out. Until 2026-11-11 this wait read only runs
+    # and statuses, and a Cloud Build deploy was invisible to it.
+    checks=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
+             --jq '[.check_runs[] | select(.app.slug != "github-actions") | {name, status, conclusion}]' 2>/dev/null || echo '[]')
+    pending=$(jq -n --argjson r "$runs" --argjson s "$statuses" --argjson c "$checks" \
+      '[$r[] | select(.status != "completed")] + [$s[] | select(.state == "pending")] + [$c[] | select(.status != "completed")] | length')
+    total=$(jq -n --argjson r "$runs" --argjson s "$statuses" --argjson c "$checks" '($r + $s + $c) | length')
+    # Settle: all-finished must hold on two polls in a row, because an external builder
+    # can register its check-run after the Actions runs are already done.
+    if [ "$pending" -eq 0 ] && [ "$total" -gt 0 ]; then settled=$((settled + 1)); else settled=0; fi
+    if [ "$settled" -ge 2 ]; then
+      failed=$(jq -rn --argjson r "$runs" --argjson s "$statuses" --argjson c "$checks" \
+        '[($r[] | select(.conclusion == "failure" or .conclusion == "timed_out") | .name),
+          ($s[] | select(.state == "failure" or .state == "error") | .context),
+          ($c[] | select(.conclusion == "failure" or .conclusion == "timed_out") | .name)] | join(", ")')
+      put phase verify
+      echo "ACTION deployed $REPO#$PR: all push runs, statuses and check-runs on ${sha:0:7} finished." \
+           "Failed: [${failed:-none}]. Verification plan: [$(get verify)]." \
+           "Deploy profile: $(profile_for). Confirm the live version, smoke, read the logs since the deploy, then run the plan," \
+           "report, then '~/.claude/bin/pr-pilot done $REPO $PR \"<result>\"'."
+      exit 0
+    fi
+    sleep "$POLL"
+  done
+  echo "TIMEOUT deploy of $REPO#$PR (${sha:0:7}) not finished after $(( DEPLOY_CAP / 60 )) min." \
+       "Report what is still running, then '~/.claude/bin/pr-pilot set $REPO $PR phase=human'."
+  exit 1
+}
+
+cmd_wait() {
+  need_args
+  [ -f "$F" ] || die "$REPO#$PR is not tracked (run track first)"
+  put watcher_pid "$$"
+  trap 'put watcher_pid ""' EXIT
+  case "$(get phase)" in
+    babysit) wait_babysit ;;
+    merge)   wait_merge ;;
+    deploy)  wait_deploy ;;
+    verify)  echo "ACTION verify $REPO#$PR is deployed; nothing to wait for. Run the plan [$(get verify)], then '~/.claude/bin/pr-pilot done'."; exit 3 ;;
+    human)   wait_human ;;
+    done)    echo "ACTION none $REPO#$PR is done; nothing to wait for."; exit 3 ;;
+    *) die "unknown phase '$(get phase)'" ;;
+  esac
+}
+
+command -v jq >/dev/null || die "jq missing"
+command -v gh >/dev/null || die "gh missing"
+CMD=${1:-}; shift || true
+case "$CMD" in
+  status) cmd_status "$@" ;;
+  prune)  cmd_prune "$@" ;;
+  track|set|wait|done)
+    REPO=${1:-}; PR=${2:-}; shift 2 2>/dev/null || true
+    "cmd_$CMD" "$@" ;;
+  *) sed -n '2,42p' "$0"; exit 2 ;;
+esac
